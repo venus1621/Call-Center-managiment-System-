@@ -164,13 +164,15 @@ async function confirmReservations(ctx, ids, date) {
     return ctx.answerCbQuery(err instanceof ReservationError ? err.message : 'Could not reserve these times. Please try again.', { show_alert: true });
   }
   for (const slot of slots) selectedTimes(ctx.state.user, fmtDate(slot.start)).delete(String(slot._id));
-  await ctx.answerCbQuery(`Reserved ${slots.length} time${slots.length === 1 ? '' : 's'}.`);
+  await ctx.answerCbQuery(slots.length === 1
+    ? `Reserved ${fmtTime(slots[0].start)}–${fmtTime(slots[0].end)} ✅`
+    : `Reserved ${slots.length} times ✅`);
   const accounts = [...new Map(slots.map((slot) => [String(slot.account._id), slot.account])).values()];
   const lines = slots.map((slot) => `${fmtDate(slot.start)} ${fmtTime(slot.start)}–${fmtTime(slot.end)} · ${esc(slot.account.name)}`);
   const otherBookings = await Booking.find({ slot: { $in: slots.map((slot) => slot._id) }, user: { $ne: ctx.state.user._id } }).populate('user');
   const others = [...new Set(otherBookings.map((booking) => booking.user?.name).filter(Boolean))];
   await ctx.reply(
-    `✅ <b>Reserved ${slots.length} time${slots.length === 1 ? '' : 's'}</b>\n${lines.join('\n')}${others.length ? `\nSharing selected slots with: ${others.map(esc).join(', ')}` : ''}\n\n${accounts.map(accountInfo).join('\n\n')}\n\nWhen your time starts, press ▶️ Start work.`,
+    `✅ <b>Reserved ${slots.length} time${slots.length === 1 ? '' : 's'} — confirmed</b>\n${lines.join('\n')}${others.length ? `\nSharing selected slots with: ${others.map(esc).join(', ')}` : ''}\n\n${accounts.map(accountInfo).join('\n\n')}\n\nWhen your time starts, press ▶️ Start work.`,
     html(workKeyboard(false))
   );
   const { text, extra } = await renderSlots(date, ctx.state.user);
