@@ -8,8 +8,10 @@ const { adminOnly } = require('../middleware/auth');
 const { encrypt } = require('../utils/crypto');
 const { esc, escapeRegex } = require('../utils/format');
 const { scheduleText } = require('../services/schedule');
+const { reserveSlots, ReservationError } = require('../services/reservations');
+const notify = require('../services/notify');
 const { disableDefaultSlots, ensureDefaultSlots } = require('../services/defaultSlots');
-const { DAY, parseDateTime, parseSlotTime, fmtTime, fmtDate, todayStr, fmtHm } = require('../utils/time');
+const { DAY, parseDateTime, parseSlotTime, fmtTime, fmtDate, fmtDateTime, todayStr, fmtHm } = require('../utils/time');
 
 const html = (extra = {}) => ({ parse_mode: 'HTML', ...extra });
 const args = (ctx) => ctx.message.text.trim().split(/\s+/).slice(1);
@@ -30,7 +32,7 @@ async function findAccounts(arg) {
 const ADMIN_HELP =
   `<b>Supervisor commands</b>\n\n` +
   `<b>Team</b>\n/requests – approve or reject join requests\n/adduser &lt;telegramId&gt; &lt;name&gt; [admin|agent]\n/users\n/removeuser &lt;@username|id&gt;\n\n` +
-  `<b>Accounts</b>\n/addaccount &lt;name&gt; &lt;login&gt; [password]\n/accounts – list &amp; who is using each now\n/idle – accounts with no active session\n\n` +
+  `<b>Accounts</b>\n/addaccount &lt;name&gt; &lt;login&gt; [password]\n/setcodes &lt;account&gt; &lt;code&gt; [code…|none] – agent codes, one per seat\n/assign &lt;agent&gt; [agent] &lt;date&gt; &lt;time&gt; [account] – book agents into a slot\n/accounts – list &amp; who is using each now\n/idle – accounts with no active session\n\n` +
   `<b>Slots</b>\n/addslots &lt;date&gt; &lt;from&gt; &lt;to&gt; &lt;account|all&gt; [minutes=60] [users=1|2]\n   e.g. /addslots 2026-10-08 2:00day 4:00night all 60 2\n   Ethiopian clock: add day or night (no spaces). Standard 24-hour times also work.\n/delslots &lt;date&gt; &lt;account|all&gt; – remove slots with no reservations\n/schedule [date] – who is booked when\n\n` +
   `<b>Reports</b>\n/accountreport &lt;account&gt; [range] – full report of one account\n/hours &lt;@name|all&gt; [range]\n/accounthours &lt;account|all&gt; [range]\n   range: today | yesterday | week | month | 2026-10-01 2026-10-07\n\n` +
   `<b>Messages</b>\n/msg &lt;@username|id|all&gt; &lt;text&gt; – send a direct message (you confirm first)\n/messages – history with delivered / confirmed counts\n/templates – ready-made messages · /addtemplate Title | text\n\n` +
@@ -79,6 +81,62 @@ function register(bot) {
     return ctx.reply(`✅ Account <b>${esc(name)}</b> saved${password ? ' (password stored encrypted, your message was deleted)' : ''}.`, html());
   });
 
+  // /setcodes CC-01 agent/1567 agent/1568 - codes are handed out one per seat of a slot
+  bot.command('setcodes', adminOnly, async (ctx) => {
+    const [name, ...codes] = args(ctx);
+    if (!name || !codes.length) return ctx.reply('Usage: /setcodes <account> <code> [code…]\nExample: /setcodes CC-01 agent/1567 agent/1568\nUse "none" to remove all codes.');
+    const acc = await Account.findOne({ name: new RegExp('^' + escapeRegex(name) + '$', 'i') });
+    if (!acc) return ctx.reply('Account not found. See /accounts.');
+    const list = codes.length === 1 && codes[0].toLowerCase() === 'none' ? [] : [...new Set(codes)];
+    await Account.updateOne({ _id: acc._id }, { agentCodes: list });
+    return ctx.reply(list.length ? `✅ <b>${esc(acc.name)}</b> agent codes: ${list.map(esc).join(', ')}` : `✅ Agent codes removed from <b>${esc(acc.name)}</b>.`, html());
+  });
+
+  // /assign <agent> [agent] <date> <time> [account] - the supervisor books agents without them pressing Reserve
+  bot.command('assign', adminOnly, async (ctx) => {
+    const a = args(ctx);
+    const usage = 'Usage: /assign <agent> [agent] <date> <time> [account]\nExample: /assign 1567 1568 2026-10-11 08:00\nAgents: Telegram ID, @username or name. Time: 24-hour or Ethiopian (2:00day).';
+    const dateIdx = a.findIndex((x) => /^\d{4}-\d{2}-\d{2}$/.test(x));
+    if (dateIdx < 1 || dateIdx > 2 || !a[dateIdx + 1]) return ctx.reply(usage);
+    const date = a[dateIdx];
+    const start = parseSlotTime(date, a[dateIdx + 1]);
+    if (!start) return ctx.reply(usage);
+    const agents = [];
+    for (const token of a.slice(0, dateIdx)) {
+      const u = await findUser(token);
+      if (!u) return ctx.reply(`❓ Agent not found: ${esc(token)}. See /users.`, html());
+      if (!agents.some((x) => String(x._id) === String(u._id))) agents.push(u);
+    }
+    const filter = { start };
+    if (a[dateIdx + 2]) {
+      const acc = await Account.findOne({ name: new RegExp('^' + escapeRegex(a[dateIdx + 2]) + '$', 'i'), active: true });
+      if (!acc) return ctx.reply('Account not found. See /accounts.');
+      filter.account = acc._id;
+    }
+    await ensureDefaultSlots(date);
+    const slots = await Slot.find(filter).populate('account');
+    const slot = slots
+      .filter((x) => x.account?.active)
+      .sort((x, y) => x.account.name.localeCompare(y.account.name))
+      .find((x) => x.bookedCount + agents.length <= config.maxCapacity);
+    if (!slot) return ctx.reply(`No slot with room for ${agents.length} agent(s) at ${date} ${a[dateIdx + 1]}. See /schedule ${date}.`);
+    if (slot.capacity < slot.bookedCount + agents.length) await Slot.updateOne({ _id: slot._id }, { capacity: slot.bookedCount + agents.length });
+
+    const lines = [];
+    for (const agent of agents) {
+      try {
+        const booked = await reserveSlots(agent, [String(slot._id)], { skipNotice: true });
+        const code = booked.agentCodes?.[String(slot._id)];
+        lines.push(`✅ ${esc(agent.name)}${code ? ` → agent code <b>${esc(code)}</b>` : ''}`);
+        await notify.toUser(agent.telegramId,
+          `📌 <b>You were assigned a slot</b>\n${fmtDateTime(slot.start)}–${fmtTime(slot.end)} · ${esc(slot.account.name)}${code ? `\n🆔 <b>Use agent code: ${esc(code)}</b>` : ''}\n\nWhen your time starts, press ▶️ Start work.`).catch(() => {});
+      } catch (err) {
+        lines.push(`❌ ${esc(agent.name)}: ${esc(err instanceof ReservationError ? err.message : 'could not be assigned')}`);
+      }
+    }
+    return ctx.reply(`📌 <b>Assignment</b> · ${date} ${fmtTime(slot.start)}–${fmtTime(slot.end)} · ${esc(slot.account.name)}\n${lines.join('\n')}`, html());
+  });
+
   bot.command('accounts', adminOnly, async (ctx) => {
     const accounts = await Account.find().sort({ name: 1 });
     if (!accounts.length) return ctx.reply('No accounts yet. Use /addaccount.');
@@ -94,7 +152,7 @@ function register(bot) {
         accounts.map((a) => {
           const users = byAcc.get(String(a._id));
           const state = !a.active ? '⛔ disabled' : users ? `🟢 in use: ${users.join('; ')}` : '⚪ free';
-          return `• <b>${esc(a.name)}</b> — ${state}`;
+          return `• <b>${esc(a.name)}</b> — ${state}${a.agentCodes?.length ? ` · codes: ${a.agentCodes.map(esc).join(', ')}` : ''}`;
         }).join('\n'),
       html()
     );

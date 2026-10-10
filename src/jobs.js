@@ -33,7 +33,7 @@ function startJobs(bot, adminBot = bot) {
     for (const b of soon) {
       const mins = Math.max(1, Math.round((b.start - now) / 60000));
       await Booking.updateOne({ _id: b._id }, { preAlarmSent: true });
-      await send(b.user.telegramId, `⏰ <b>Your slot starts in ${mins} min</b> (${fmtTime(b.start)}–${fmtTime(b.end)})\n\n${accountInfo(b.account)}`, startBtn);
+      await send(b.user.telegramId, `⏰ <b>Your slot starts in ${mins} min</b> (${fmtTime(b.start)}–${fmtTime(b.end)})\n\n${accountInfo(b.account, b.agentCode)}`, startBtn);
     }
 
     // 2) Reminder if the agent has not pressed Start shortly after the slot began
@@ -45,7 +45,7 @@ function startJobs(bot, adminBot = bot) {
     for (const b of late) {
       await Booking.updateOne({ _id: b._id }, { startReminderSent: true });
       if (await Session.exists({ slot: b.slot, user: b.user._id })) continue;
-      await send(b.user.telegramId, `⚠️ Your slot began at ${fmtTime(b.start)} and you haven't started yet.\n\n${accountInfo(b.account)}`, startBtn);
+      await send(b.user.telegramId, `⚠️ Your slot began at ${fmtTime(b.start)} and you haven't started yet.\n\n${accountInfo(b.account, b.agentCode)}`, startBtn);
     }
 
     // 3) Auto-close sessions the agent forgot to end

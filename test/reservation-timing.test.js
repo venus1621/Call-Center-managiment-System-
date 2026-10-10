@@ -23,6 +23,8 @@ const Session = require('../src/models/Session');
 const ScheduleOverride = require('../src/models/ScheduleOverride');
 const { auth } = require('../src/middleware/auth');
 const agent = require('../src/handlers/agent');
+const admin = require('../src/handlers/admin');
+const notify = require('../src/services/notify');
 const { reserveSlots, ReservationError } = require('../src/services/reservations');
 const { startJobs } = require('../src/jobs');
 
@@ -33,6 +35,7 @@ let events;
 let bot;
 let updateId = 0;
 const users = {};
+let pushed = [];
 
 // All times are relative to "now" and rounded to whole seconds so tests stay deterministic.
 const at = (offsetMin) => new Date(Math.round((Date.now() + offsetMin * MIN) / 1000) * 1000);
@@ -56,6 +59,7 @@ beforeEach(async () => {
   users.a = await User.create({ telegramId: 1001, name: 'Agent A' });
   users.b = await User.create({ telegramId: 1002, name: 'Agent B' });
   users.c = await User.create({ telegramId: 1003, name: 'Agent C' });
+  users.admin = await User.create({ telegramId: 9001, name: 'Boss', role: 'admin' });
   events = [];
   bot = new Telegraf('123456:test');
   bot.botInfo = { id: 123456, is_bot: true, first_name: 'Test', username: 'timing_test_bot' };
@@ -64,6 +68,10 @@ beforeEach(async () => {
   }
   bot.use(auth);
   agent.register(bot);
+  admin.register(bot);
+  pushed = [];
+  const fakeBot = { telegram: { sendMessage: async (chatId, text) => { pushed.push({ chatId, text }); } } };
+  notify.setBots(fakeBot, fakeBot);
 });
 
 after(async () => {
@@ -451,4 +459,81 @@ test('batch confirmation lists every confirmed time; a failed booking sends no c
   assert.match(toast(), /full|no longer available|last place/);
   await callback(1001, `slot:book:${s1._id}`);
   assert.ok(replyText().includes(`${fmtTime(s1.start)}–${fmtTime(s1.end)}`));
+});
+
+// ---------- agent codes & supervisor assignment ----------
+
+test('agents sharing a slot get different agent codes, and the confirmation tells them which to use', async () => {
+  await Account.updateOne({ _id: account._id }, { agentCodes: ['agent/1567', 'agent/1568'] });
+  const slot = await mk(120, { capacity: 2 });
+  await callback(1001, `slot:book:${slot._id}`);
+  assert.match(replyText(), /Log in with agent code: agent[/]1567/);
+  await callback(1002, `slot:book:${slot._id}`);
+  assert.match(replyText(), /Log in with agent code: agent[/]1568/);
+  const codes = (await Booking.find({ slot: slot._id })).map((b) => b.agentCode).sort();
+  assert.deepEqual(codes, ['agent/1567', 'agent/1568']);
+});
+
+test('a cancelled agent code is handed out again; the same code is never held twice', async () => {
+  await Account.updateOne({ _id: account._id }, { agentCodes: ['agent/1567', 'agent/1568'] });
+  const slot = await mk(180, { capacity: 2 });
+  await reserve(users.a, slot);
+  await reserve(users.b, slot);
+  const first = await Booking.findOne({ user: users.a._id });
+  await callback(1001, `slot:cancel:${first._id}`);
+  await reserve(users.c, slot);
+  const taken = await Booking.find({ slot: slot._id });
+  assert.equal(new Set(taken.map((b) => b.agentCode)).size, 2);
+  assert.equal((await Booking.findOne({ user: users.c._id })).agentCode, 'agent/1567');
+});
+
+test('racing agents never receive the same agent code', async () => {
+  await Account.updateOne({ _id: account._id }, { agentCodes: ['agent/1567', 'agent/1568'] });
+  const slot = await mk(240, { capacity: 2 });
+  await Promise.allSettled([reserve(users.a, slot), reserve(users.b, slot), reserve(users.c, slot)]);
+  const bookings = await Booking.find({ slot: slot._id });
+  assert.equal(bookings.length, 2);
+  assert.equal(new Set(bookings.map((b) => b.agentCode)).size, 2);
+});
+
+test('/setcodes saves codes on the account', async () => {
+  await command(9001, '/setcodes T-01 agent/1567 agent/1568');
+  assert.deepEqual((await Account.findById(account._id)).agentCodes, ['agent/1567', 'agent/1568']);
+  await command(9001, '/setcodes T-01 none');
+  assert.deepEqual((await Account.findById(account._id)).agentCodes, []);
+});
+
+test('/assign books both agents into one slot with different codes and notifies them', async () => {
+  const { todayStr, addDays, parseDateTime } = require('../src/utils/time');
+  const date = addDays(todayStr(), 4);
+  await Account.updateOne({ _id: account._id }, { agentCodes: ['agent/1567', 'agent/1568'] });
+  const start = parseDateTime(date, '08:00');
+  await Slot.create({ account: account._id, start, end: new Date(start.getTime() + 60 * MIN), capacity: 1 });
+  await command(9001, `/assign 1001 1002 ${date} 08:00 T-01`);
+  const bookings = await Booking.find({ account: account._id, start });
+  assert.equal(bookings.length, 2);
+  assert.deepEqual(bookings.map((b) => b.agentCode).sort(), ['agent/1567', 'agent/1568']);
+  assert.equal((await Slot.findOne({ account: account._id, start })).capacity, 2);
+  assert.equal(pushed.length, 2);
+  assert.ok(pushed.every((m) => /Use agent code: agent[/]156[78]/.test(m.text)));
+  assert.match(replyText(), /Assignment/);
+});
+
+test('/assign refuses a third agent, an unknown agent, and a duplicate of the same agent', async () => {
+  const { todayStr, addDays, parseDateTime } = require('../src/utils/time');
+  const date = addDays(todayStr(), 4);
+  const start = parseDateTime(date, '09:00');
+  await Slot.create({ account: account._id, start, end: new Date(start.getTime() + 60 * MIN), capacity: 2 });
+  await command(9001, `/assign 1001 1002 ${date} 09:00 T-01`);
+  await command(9001, `/assign 1003 ${date} 09:00 T-01`);
+  assert.match(replyText(), /No slot with room/);
+  await command(9001, `/assign 5555 ${date} 10:00`);
+  assert.match(replyText(), /Agent not found/);
+  assert.equal(await Booking.countDocuments({ account: account._id, start }), 2);
+});
+
+test('/assign is admin-only', async () => {
+  const { todayStr, addDays } = require('../src/utils/time');
+  await command(1001, `/assign 1002 ${addDays(todayStr(), 4)} 08:00`);
+  assert.equal(await Booking.countDocuments(), 0);
 });

@@ -167,12 +167,14 @@ async function confirmReservations(ctx, ids, date) {
   await ctx.answerCbQuery(slots.length === 1
     ? `Reserved ${fmtTime(slots[0].start)}–${fmtTime(slots[0].end)} ✅`
     : `Reserved ${slots.length} times ✅`);
+  const codes = slots.agentCodes || {};
   const accounts = [...new Map(slots.map((slot) => [String(slot.account._id), slot.account])).values()];
-  const lines = slots.map((slot) => `${fmtDate(slot.start)} ${fmtTime(slot.start)}–${fmtTime(slot.end)} · ${esc(slot.account.name)}`);
+  const lines = slots.map((slot) => `${fmtDate(slot.start)} ${fmtTime(slot.start)}–${fmtTime(slot.end)} · ${esc(slot.account.name)}${codes[String(slot._id)] ? ` · 🆔 <b>${esc(codes[String(slot._id)])}</b>` : ''}`);
+  const usedCodes = [...new Set(slots.map((slot) => codes[String(slot._id)]).filter(Boolean))];
   const otherBookings = await Booking.find({ slot: { $in: slots.map((slot) => slot._id) }, user: { $ne: ctx.state.user._id } }).populate('user');
   const others = [...new Set(otherBookings.map((booking) => booking.user?.name).filter(Boolean))];
   await ctx.reply(
-    `✅ <b>Reserved ${slots.length} time${slots.length === 1 ? '' : 's'} — confirmed</b>\n${lines.join('\n')}${others.length ? `\nSharing selected slots with: ${others.map(esc).join(', ')}` : ''}\n\n${accounts.map(accountInfo).join('\n\n')}\n\nWhen your time starts, press ▶️ Start work.`,
+    `✅ <b>Reserved ${slots.length} time${slots.length === 1 ? '' : 's'} — confirmed</b>\n${lines.join('\n')}${others.length ? `\nSharing selected slots with: ${others.map(esc).join(', ')}` : ''}${usedCodes.length ? `\n\n🆔 <b>Log in with agent code: ${usedCodes.map(esc).join(', ')}</b>` : ''}\n\n${accounts.map((account) => accountInfo(account)).join('\n\n')}\n\nWhen your time starts, press ▶️ Start work.`,
     html(workKeyboard(false))
   );
   const { text, extra } = await renderSlots(date, ctx.state.user);
@@ -236,7 +238,7 @@ async function startWork(ctx) {
   const late = Math.max(0, Math.round((now - booking.start) / 60000));
   await Session.create({ slot: booking.slot, account: booking.account._id, user: user._id, startedAt: now, lateMinutes: late });
   return ctx.reply(
-    `▶️ <b>Work started</b> at ${fmtTime(now)}${late ? ` (${late} min late)` : ''}\nSlot ends at ${fmtTime(booking.end)}.\n\n${accountInfo(booking.account)}`,
+    `▶️ <b>Work started</b> at ${fmtTime(now)}${late ? ` (${late} min late)` : ''}\nSlot ends at ${fmtTime(booking.end)}.\n\n${accountInfo(booking.account, booking.agentCode)}`,
     html(workKeyboard(true))
   );
 }
@@ -258,7 +260,7 @@ async function showAccount(ctx) {
   const b = await Booking.findOne({ user: user._id, end: { $gt: new Date() } }).sort({ start: 1 }).populate('account');
   if (!b) return ctx.reply('You have no upcoming reservation. Reserve a time first.', html(chooseTimeKeyboard()));
   const active = await Session.exists({ user: user._id, status: 'active' });
-  return ctx.reply(`🔑 <b>${fmtDateTime(b.start)} – ${fmtTime(b.end)}</b>\n\n${accountInfo(b.account)}`, html(workKeyboard(!!active)));
+  return ctx.reply(`🔑 <b>${fmtDateTime(b.start)} – ${fmtTime(b.end)}</b>\n\n${accountInfo(b.account, b.agentCode)}`, html(workKeyboard(!!active)));
 }
 
 const bar = (done, total) => {

@@ -339,13 +339,14 @@ test('a failed batch write removes its partial bookings and preserves other rese
     const slot = await tomorrowSlot(time);
     await callback(1001, `slot:toggle:${slot._id}`);
   }
-  const original = Booking.insertMany;
-  Booking.insertMany = async function (documents) {
-    await Booking.create(documents[0]);
-    throw new Error('Simulated interrupted write');
+  const original = Booking.create;
+  let calls = 0;
+  Booking.create = async function (...args) {
+    if (++calls > 1) throw new Error('Simulated interrupted write');
+    return original.apply(this, args);
   };
   try { await callback(1001, `slots:reserve:${tomorrow()}`); }
-  finally { Booking.insertMany = original; }
+  finally { Booking.create = original; }
   assert.match(last('answerCbQuery').args[0], /Could not reserve/);
   assert.equal(await Booking.countDocuments(), 1);
   assert.ok(await Booking.exists({ slot: existingSlot._id, user: user._id }));
