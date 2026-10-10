@@ -41,7 +41,17 @@ const adminCommands = [
 const adminGate = (ctx, next) =>
   ctx.state.user?.role === 'admin' ? next() : ctx.reply('⛔ This bot is for supervisors only. Use the agents bot instead.');
 
+/** Render web services must bind a port; this also serves as a health check. */
+function startHealthServer() {
+  const port = process.env.PORT;
+  if (!port) return null;
+  return require('http')
+    .createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('ok'); })
+    .listen(Number(port), '0.0.0.0', () => console.log(`Health server listening on ${port}`));
+}
+
 async function main() {
+  startHealthServer();
   await mongoose.connect(config.mongoUri);
   console.log('MongoDB connected');
   await Promise.all([require('./models/User').init(), require('./models/Account').init(), require('./models/Slot').init(), require('./models/ScheduleOverride').init(), require('./models/Booking').init(), require('./models/Session').init(), require('./models/Message').init()]);
